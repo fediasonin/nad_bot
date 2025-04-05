@@ -172,8 +172,12 @@ def monitor():
 def main():
     global nad_client
     nad_client = PTNADClient(config.BASE_URL, config.USERNAME, config.PASSWORD)
-    nad_client.authenticate()
-    monitor()
+    if nad_client.authenticate():
+        logging.info("Отправка тестового сообщения при старте бота")
+        send_telegram_message("🤖 Бот PT NAD запущен и начал мониторинг")
+        monitor()
+    else:
+        logging.error("Не удалось запустить бота из-за ошибки аутентификации")
 
 
 if __name__ == "__main__":
