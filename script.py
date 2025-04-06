@@ -115,7 +115,15 @@ def send_telegram_message(message: str):
         logging.error(f"Не удалось отправить сообщение в Телеграм: {e}")
 
 
-
+def format_template(template: str, vars: dict) -> str:
+    """
+    Форматирует шаблон сообщения, подставляя значения переменных.
+    """
+    try:
+        return template.format(**vars)
+    except KeyError as e:
+        logging.error(f"Ошибка при форматировании шаблона: {e}")
+        return template
 
 def monitor():
     global last_problems_keys, last_status, server_down_notified
@@ -155,8 +163,10 @@ def monitor():
                     for idx, problem in enumerate(problems, start=1):
                         p_status = problem.get("status", "")
                         template = problem.get("template", "")
+                        vars = problem.get("vars", {})
                         problem_emoji = STATUS_EMOJIS.get(p_status, "❔")
-                        message_lines.append(f" {idx}. Уровень: {problem_emoji}, Описание: {template}")
+                        formatted_template = format_template(template, vars)
+                        message_lines.append(f" {idx}. Уровень: {problem_emoji}, Описание: {formatted_template}")
                 else:
                     message_lines.append("Статус не GREEN, но список проблем пуст.")
                 send_telegram_message("\n".join(message_lines))
