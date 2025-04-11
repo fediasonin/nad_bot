@@ -18,9 +18,9 @@
 ### config.py
 
 BASE_URL = "https://your-nad-server.com" 
+
 USERNAME = "your_username"
 PASSWORD = "your_password"
-
 TELEGRAM_TOKEN = "your_telegram_bot_token"
 CHAT_ID = "your_chat_id"
 
