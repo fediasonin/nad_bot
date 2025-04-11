@@ -15,9 +15,9 @@
 ## 🛠 Конфигурация
 
 Создайте файл config.py в том же каталоге со следующим содержимым:
-# config.py
+### config.py
 
-BASE_URL = "https://your-nad-server.com"
+BASE_URL = "https://your-nad-server.com" 
 USERNAME = "your_username"
 PASSWORD = "your_password"
 
