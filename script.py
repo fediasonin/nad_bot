@@ -1,194 +1,163 @@
+import os
 import requests
 import logging
 from threading import Timer
 from urllib3.exceptions import InsecureRequestWarning
 import config
 
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s"
+)
 
-server_down_notified = False
-last_status = None
-last_problems_keys = set()
+# ---------------------------------------------------------------------------
+# GLOBAL STATE
+# ---------------------------------------------------------------------------
+last_status = None                 # последний известный статус ("green","yellow","red","unknown")
+last_problems_keys = set()         # сигнатуры проблем из прошлого цикла
+status_message_id = None           # message_id редактируемого статус-бара
+STATUS_ID_FILE = "status_msg_id.txt"
 
 STATUS_EMOJIS = {
     "red": "🔴",
     "yellow": "🟡",
     "green": "🟢",
-    "unknown": "❔"
+    "unknown": "❔",
 }
 
-
-
+# ---------------------------------------------------------------------------
+# PT NAD API CLIENT
+# ---------------------------------------------------------------------------
 class PTNADClient:
     def __init__(self, base_url: str, username: str, password: str):
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
-
-
-
-
         self.session = requests.Session()
         self.session.verify = False
         requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
         self.headers = {}
-        self.csrf_token = None
 
-    def authenticate(self):
-        auth_url = f"{self.base_url}/auth/login"
+    def authenticate(self) -> bool:
+        url = f"{self.base_url}/auth/login"
         try:
-            response = self.session.post(auth_url, json={
-                "username": self.username,
-                "password": self.password
-            })
-            if response.status_code == 200:
-                logging.info("Успешная аутентификация.")
+            r = self.session.post(url, json={"username": self.username, "password": self.password})
+            if r.status_code == 200:
+                logging.info("Успешная аутентификация в PT NAD")
                 if 'csrftoken' in self.session.cookies:
-                    self.csrf_token = self.session.cookies['csrftoken']
-                    self.headers["X-CSRFToken"] = self.csrf_token
-                    logging.info("CSRF-токен получен и добавлен в заголовки.")
-                else:
-                    logging.warning("CSRF-токен не найден. Возможно, не требуется.")
+                    self.headers['X-CSRFToken'] = self.session.cookies['csrftoken']
                 return True
-            else:
-                logging.error(f"Ошибка аутентификации: {response.status_code} - {response.text}")
-                return False
+            logging.error("Ошибка аутентификации: %s %s", r.status_code, r.text)
+            return False
         except Exception as e:
-            logging.error(f"Ошибка при аутентификации: {e}")
+            logging.error("Исключение при аутентификации: %s", e)
             return False
 
     def get_monitoring_status(self) -> dict:
         url = f"{self.base_url}/monitoring/status"
         try:
-            response = self.session.get(url, headers=self.headers)
-
-            if response.status_code == 200:
-                return response.json()
-
-            elif response.status_code in (401, 403):
-                logging.warning(f"Получен код {response.status_code}, пробуем заново аутентифицироваться...")
-
-                if self.authenticate():
-                    response2 = self.session.get(url, headers=self.headers)
-                    if response2.status_code == 200:
-                        return response2.json()
-                    else:
-                        logging.error(
-                            f"Ошибка после повторной аутентификации: {response2.status_code} - {response2.text}")
-                        return {}
-                else:
-                    logging.error("Не удалось переавторизоваться после 401/403.")
-                    return {}
-
-            else:
-                logging.error(f"Ошибка при запросе {url}: {response.status_code} - {response.text}")
-                return {}
-
+            r = self.session.get(url, headers=self.headers)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (401, 403) and self.authenticate():
+                r2 = self.session.get(url, headers=self.headers)
+                if r2.status_code == 200:
+                    return r2.json()
+            logging.error("Ошибка получения статуса: %s %s", r.status_code, r.text)
+            return {}
         except Exception as e:
-            logging.error(f"Исключение при запросе к {url}: {e}")
+            logging.error("Исключение при запросе статуса: %s", e)
             return {}
 
+# ---------------------------------------------------------------------------
+# TELEGRAM STATUS BAR
+# ---------------------------------------------------------------------------
+def upsert_status_bar(html: str):
+    """Создать или отредактировать единственное сообщение-статус-бар."""
+    global status_message_id
+    base = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}"
+    # восстановить ID после рестарта
+    if status_message_id is None and os.path.exists(STATUS_ID_FILE):
+        try:
+            status_message_id = int(open(STATUS_ID_FILE).read().strip())
+        except:
+            status_message_id = None
+    # редактируем, если можем
+    if status_message_id:
+        resp = requests.post(f"{base}/editMessageText", data={
+            "chat_id": config.CHAT_ID,
+            "message_id": status_message_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        })
+        if resp.status_code == 200:
+            return
+        # если удалено вручную
+        if resp.status_code == 400 and 'message to edit not found' in resp.text.lower():
+            status_message_id = None
+    # иначе отправляем новое
+    resp = requests.post(f"{base}/sendMessage", data={
+        "chat_id": config.CHAT_ID,
+        "text": html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    })
+    if resp.status_code == 200:
+        status_message_id = resp.json()['result']['message_id']
+        with open(STATUS_ID_FILE, 'w') as f:
+            f.write(str(status_message_id))
 
-def problem_signature(problem: dict) -> tuple:
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+def signature(problem: dict) -> tuple:
     return (
-        problem.get("status", ""),
-        problem.get("template", ""),
-        str(problem.get("vars", {}))
+        problem.get('status', ''),
+        problem.get('template', ''),
+        str(problem.get('vars', {})),
     )
 
 
-def send_telegram_message(message: str):
-    """
-    Отправка сообщения в Телеграм.
-    """
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": config.CHAT_ID, "text": message}
-    try:
-        logging.info(f"Отправка сообщения в Telegram: {message}")
-        response = requests.post(url, data=data)
-        if response.status_code == 200:
-            logging.info("Сообщение успешно отправлено в Telegram")
-        else:
-            logging.error(f"Ошибка при отправке сообщения в Telegram. Код: {response.status_code}, Ответ: {response.text}")
-    except Exception as e:
-        logging.error(f"Не удалось отправить сообщение в Телеграм: {e}")
+def render_status(status: str, problems: list) -> str:
+    """Генерирует HTML-текст для статуса и списка проблем."""
+    lines = [f"<b>Статус PT NAD:</b> {STATUS_EMOJIS.get(status, '❔')}"]
+    if problems:
+        lines.append("<b>Проблемы:</b>")
+        for idx, p in enumerate(problems, 1):
+            emoji = STATUS_EMOJIS.get(p['status'], '❔')
+            description = p['template'].format(**p['vars'])
+            lines.append(f"{idx}.{emoji} {description}")
+    return "\n".join(lines)
 
-
-def format_template(template: str, vars: dict) -> str:
-    """
-    Форматирует шаблон сообщения, подставляя значения переменных.
-    """
-    try:
-        return template.format(**vars)
-    except KeyError as e:
-        logging.error(f"Ошибка при форматировании шаблона: {e}")
-        return template
-
+# ---------------------------------------------------------------------------
+# MONITOR LOOP
+# ---------------------------------------------------------------------------
 def monitor():
-    global last_problems_keys, last_status, server_down_notified
-
-    logging.info("Начало проверки статуса мониторинга")
-    monitoring_data = nad_client.get_monitoring_status()
-    logging.info(f"Получены данные мониторинга: {monitoring_data}")
-
-    if not monitoring_data:
-        if not server_down_notified:
-            logging.warning("Сервер недоступен, отправка уведомления")
-            send_telegram_message("❗ Сервер PT NAD недоступен.")
-            server_down_notified = True
-        last_problems_keys = set()
-        last_status = None
+    """Проверяет статус и обновляет статус-бар при изменениях."""
+    global last_status, last_problems_keys
+    data = client.get_monitoring_status()
+    if data:
+        curr = data.get('status', 'unknown')
+        probs = data.get('problems', [])
     else:
-        if server_down_notified:
-            logging.info("Сервер снова доступен, отправка уведомления")
-            send_telegram_message("✅ Сервер PT NAD снова доступен.")
-            server_down_notified = False
-
-        current_status = monitoring_data.get("status", "unknown")
-        problems = monitoring_data.get("problems", [])
-        new_problems_keys = {problem_signature(p) for p in problems}
-        
-        logging.info(f"Текущий статус: {current_status}, Предыдущий статус: {last_status}")
-        logging.info(f"Количество проблем: {len(problems)}")
-
-        if current_status != last_status or new_problems_keys != last_problems_keys:
-            status_emoji = STATUS_EMOJIS.get(current_status, "❔")
-            logging.info(f"Обнаружено изменение статуса или проблем, отправка уведомления")
-
-            if current_status in ("red", "yellow"):
-                message_lines = [f"Текущий статус PT NAD: {status_emoji}"]
-                if problems:
-                    message_lines.append("Список проблем:")
-                    for idx, problem in enumerate(problems, start=1):
-                        p_status = problem.get("status", "")
-                        template = problem.get("template", "")
-                        vars = problem.get("vars", {})
-                        problem_emoji = STATUS_EMOJIS.get(p_status, "❔")
-                        formatted_template = format_template(template, vars)
-                        message_lines.append(f" {idx}. Уровень: {problem_emoji}, Описание: {formatted_template}")
-                else:
-                    message_lines.append("Статус не GREEN, но список проблем пуст.")
-                send_telegram_message("\n".join(message_lines))
-
-            last_status = current_status
-            last_problems_keys = new_problems_keys
-        else:
-            logging.info("Изменений в статусе или проблемах не обнаружено")
-
-    logging.info(f"Следующая проверка через {config.CHECK_INTERVAL} секунд")
+        curr, probs = 'unknown', []
+    keys = {signature(p) for p in probs}
+    # обновляем только при изменении статуса или проблем
+    if curr != last_status or keys != last_problems_keys:
+        html = render_status(curr, probs)
+        upsert_status_bar(html)
+        last_status, last_problems_keys = curr, keys
+    # планируем следующую проверку
     Timer(config.CHECK_INTERVAL, monitor).start()
 
-def main():
-    global nad_client
-    nad_client = PTNADClient(config.BASE_URL, config.USERNAME, config.PASSWORD)
-    if nad_client.authenticate():
-        logging.info("Отправка тестового сообщения при старте бота")
-        send_telegram_message("🤖 Бот PT NAD запущен и начал мониторинг")
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    client = PTNADClient(config.BASE_URL, config.USERNAME, config.PASSWORD)
+    if client.authenticate():
         monitor()
     else:
-        logging.error("Не удалось запустить бота из-за ошибки аутентификации")
-
-
-if __name__ == "__main__":
-    main()
+        logging.error('Не удалось пройти аутентификацию, выходим')
