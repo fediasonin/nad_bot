@@ -150,7 +150,7 @@ def monitor():
         p for p in probs
         if signature(p) not in last_problems_keys
         and p.get('status') == 'red'
-        and 'свободн' not in p.get('template', '').lower()
+        and 'disk space' not in p.get('template', '').lower()
     ]
 
     for p in new_red_problems:
