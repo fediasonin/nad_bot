@@ -135,7 +135,6 @@ def render_status(status: str, problems: list) -> str:
 # MONITOR LOOP
 # ---------------------------------------------------------------------------
 def monitor():
-    """Проверяет статус и обновляет статус-бар при изменениях."""
     global last_status, last_problems_keys
     data = client.get_monitoring_status()
     if data:
@@ -143,13 +142,37 @@ def monitor():
         probs = data.get('problems', [])
     else:
         curr, probs = 'unknown', []
+
     keys = {signature(p) for p in probs}
+
+    # выявляем новые критические проблемы
+    new_red_problems = [
+        p for p in probs
+        if signature(p) not in last_problems_keys
+        and p.get('status') == 'red'
+        and 'свободн' not in p.get('template', '').lower()
+    ]
+
+    for p in new_red_problems:
+        emoji = STATUS_EMOJIS.get(p['status'], '❔')
+        description = p['template'].format(**p.get('vars', {}))
+        message = f"{emoji} <b>Новая критичная проблема:</b>\n{description}"
+        requests.post(
+            f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage",
+            data={
+                "chat_id": config.CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+        )
+
     # обновляем только при изменении статуса или проблем
     if curr != last_status or keys != last_problems_keys:
         html = render_status(curr, probs)
         upsert_status_bar(html)
         last_status, last_problems_keys = curr, keys
-    # планируем следующую проверку
+
     Timer(config.CHECK_INTERVAL, monitor).start()
 
 # ---------------------------------------------------------------------------
